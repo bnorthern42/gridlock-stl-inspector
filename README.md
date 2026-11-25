@@ -1,23 +1,31 @@
 # gridlock-stl-inspector
 
-Out-of-tree **C++23 native plugin** for the **GridLock** MPI debugger (`ABI v1.0`).
+Out-of-tree **C++23 native plugin** for the **GridLock** MPI debugger (`C99 ABI v1.0`).
 
-`gridlock-stl-inspector` inspects contiguous numeric C++ standard library containers (`std::vector`, `std::array`, `std::valarray`, and `std::span`) on stopped MPI ranks and computes non-mutating summary reductions (**Min**, **Max**, **Arithmetic Mean**, and **L2 Norm**) directly from inferior memory without modifying target state or linking Qt6/internal GridLock libraries.
+`gridlock-stl-inspector` inspects contiguous numeric C++ standard library containers (`std::vector`, `std::array`, `std::valarray`, and `std::span` over `float`, `double`, and 32/64-bit signed/unsigned integers) on stopped MPI ranks and computes non-mutating summary reductions (**Min**, **Max**, **Arithmetic Mean**, and **L2 Norm**) directly from inferior memory without modifying target state or linking Qt6/internal GridLock libraries.
 
 ---
 
-## Features
+## Workstation Features
 
-- **Variables Context-Menu Action**:
+- **Variables Dock Context Action (`register_variable_action`)**:
   - Registers **"Compute Vector Summary Stats (Min / Max / Mean / L2)"** for variables matching `.*(std::vector|std::array|std::valarray|std::span).*`.
-  - Evaluates `<expr>.size()` and `<expr>.data()` (with `&(<expr>[0])` fallback for `std::valarray`) via `gridlock::plugin::evalExpr` and samples up to `1024` `float` or `double` elements via `gridlock::plugin::readBytes`.
-- **Tools Menu Command**:
-  - Registers **"STL Inspector: Summarize Active Rank Stop"** so you can recompute stats for the tracked container when switching active MPI ranks or inspect the latest rank stop state on demand.
-- **Automatic Stop-Hook Tracking**:
-  - Once you inspect a container variable (or set `GRIDLOCK_STL_INSPECTOR_EXPR=<expr>` in the environment), `on_rank_stopped` automatically refreshes summary statistics whenever an MPI rank hits a breakpoint or steps.
-- **Structured Telemetry & Logging**:
-  - Logs concise one-line summaries via `host->log_message(..., GRIDLOCK_LOG_INFO, ...)`.
-  - Emits RFC 8259 JSON events on channel `"gridlock.plugin.stl_inspector"`:
+  - Evaluates `<expr>.size()` and `<expr>.data()` (with `&(<expr>[0])` fallback for `std::valarray`) via `gridlock::plugin::evalExpr` and samples up to `1024` numeric elements (`f32`, `f64`, `i32`, `u32`, `i64`, `u64`) via `gridlock::plugin::readBytes`.
+- **`Tools -> Plugins` Commands & Nested Submenu (`register_command_action` / `register_menu_action`)**:
+  - **"STL Inspector: Summarize Active Rank Stop"**: Recomputes summary statistics for the tracked container on the focused MPI rank (or logs current stop status when idle).
+  - **"STL Inspector / Inspect Container Expression..."** (`Ctrl+Alt+Shift+S`): Prompts interactively via `gridlock::plugin::promptInput` for any C++ container expression.
+  - **"STL Inspector / Open JSON Telemetry Tree"**: Publishes the latest structured payload into an expandable `GRIDLOCK_REPORT_JSON_TREE` tab.
+  - **"STL Inspector / Clear Annotations & Reset"**: Clears tracked container state, inline source badges, and report panels.
+- **Multi-Surface Context Menus (`register_context_action`)**:
+  - **Source Editor**: Right-click a symbol or highlighted expression -> **"Inspect Selected STL Container (Min / Max / Mean / L2)"**.
+  - **Call Stack**: Right-click a stack frame -> **"Summarize Tracked STL Container in Frame"**.
+  - **Server Rack / MPI Rank List**: Right-click any MPI rank card -> **"Summarize Tracked STL Container on Rank"**.
+- **Status-Bar Pill, Inline Editor Badges, Toasts & Reports**:
+  - Mounts a clickable status-bar badge (`STL R0: L2=...`, switching to `"error"` styling on `NaN` / `Inf` detection) that opens a `GRIDLOCK_REPORT_MARKDOWN` summary tab in **Plugin Reports** and jumps to the last stop location.
+  - Attaches inline source-line annotations (`set_editor_annotation`) on stopped frames and syncs live workstation palette tokens (`get_theme_info` + `on_theme_changed`).
+- **Automatic Stop-Hook Tracking & Structured Telemetry**:
+  - Once you inspect a container variable (or set `GRIDLOCK_STL_INSPECTOR_EXPR=<expr>`), `on_rank_stopped` refreshes summary statistics automatically whenever an MPI rank stops.
+  - Logs concise one-line summaries via `host->log_message` and emits RFC 8259 JSON payloads on channel `"gridlock.plugin.stl_inspector"`:
     ```json
     {
       "rank": 0,
@@ -30,8 +38,8 @@ Out-of-tree **C++23 native plugin** for the **GridLock** MPI debugger (`ABI v1.0
     }
     ```
 - **Strict ABI Isolation**:
-  - Built with `-fvisibility=hidden` and `-fvisibility-inlines-hidden`, exporting **only** `gridlock_plugin_init_v1`.
-  - All C ABI callbacks are `noexcept` + `try / catch (...)` guarded with heap-owned `PluginState` cleaned up symmetrically in `shutdown`.
+  - Built with `-fvisibility=hidden`, `-fvisibility-inlines-hidden`, and a linker version script exporting **only** `gridlock_plugin_init_v1`.
+  - All C ABI callbacks are `noexcept` + `try / catch (...)` guarded with heap-owned `PluginState` freed symmetrically in `shutdown`.
 
 ---
 
@@ -43,19 +51,30 @@ Out-of-tree **C++23 native plugin** for the **GridLock** MPI debugger (`ABI v1.0
 
 ---
 
-## One-Click Installation in GridLock (Recommended)
+## Installation
 
-1. Open GridLock and navigate to **Preferences -> Plugins -> Install from GitHub**.
-2. Paste this repository URL:
+### Option 1: One-Click Install in GridLock (`Preferences -> Plugins -> Install from Git`)
+
+1. Open **Edit -> Preferences** (`Ctrl+,`), select **Plugins**, and switch to the **Install from Git** tab.
+2. Keep **Git Host** set to **GitHub (`github.com`)** and enter the shorthand (or full URL):
    ```text
-   https://github.com/bnorthern42/gridlock-stl-inspector
+   bnorthern42/gridlock-stl-inspector
    ```
-3. Choose **Global** (or **Workspace**) scope and click **Install**.
-4. GridLock clones the repository into an isolated staging directory, invokes Meson + Ninja with `-Dgridlock_include_dir=...` automatically, verifies `gridlock_plugin_init_v1`, and loads the compiled plugin immediately.
+3. Choose **Global (`~/.config/gridlock/plugins`)** or **This Workspace (`<workspace>/.gridlock/plugins`)** and click **Clone & Build**.
+4. Click **Restart GridLock Now** when prompted to activate the plugin.
 
----
+### Option 2: Declarative `plugins.toml` Manifest
 
-## Manual Build & Installation
+Add an entry to `~/.config/gridlock/plugins.toml` (Global) or `<workspace>/.gridlock/plugins.toml` (Workspace), then click **Sync `plugins.toml`** in **Preferences -> Plugins -> Install from Git**:
+
+```toml
+[[plugins]]
+repo = "bnorthern42/gridlock-stl-inspector"
+build = "auto"
+enabled = true
+```
+
+### Option 3: Manual Build & Placement
 
 Configure and build with Meson + Ninja (pass `-Dgridlock_include_dir=...` if GridLock's headers are not installed under `/usr/local/include`):
 
@@ -64,20 +83,20 @@ meson setup builddir -Dgridlock_include_dir=/usr/local/include
 ninja -C builddir
 ```
 
-Verify that `gridlock_plugin_init_v1` is the sole exported dynamic text symbol:
+Verify that `gridlock_plugin_init_v1` is the sole exported dynamic symbol:
 
 ```bash
 nm -D --defined-only builddir/libgridlock_stl_inspector.so
 ```
 
-Copy the built shared module into your user GridLock plugins directory:
+Copy the built shared module into your global or workspace GridLock plugins directory:
 
 ```bash
 mkdir -p ~/.config/gridlock/plugins
 cp builddir/libgridlock_stl_inspector.so ~/.config/gridlock/plugins/
 ```
 
-*(On macOS, copy `builddir/libgridlock_stl_inspector.dylib` into `~/Library/Application Support/gridlock/plugins/`.)*
+*(On macOS, copy `builddir/libgridlock_stl_inspector.dylib`.)*
 
 ---
 

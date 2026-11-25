@@ -80,6 +80,7 @@ shared_module(
   link_args: extra_link_args,
   link_depends: link_depends_files,
   gnu_symbol_visibility: 'hidden',
+  name_prefix: 'lib',
   name_suffix: darwin_suffix,
   install: false,
 )
