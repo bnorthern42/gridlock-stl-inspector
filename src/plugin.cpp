@@ -99,6 +99,17 @@ enum class NumericKind : uint8_t {
   UInt64,
 };
 
+enum class ContainerFamily : uint8_t {
+  Unknown,
+  StdVector,
+  StdArray,
+  StdValarray,
+  StdSpan,
+};
+
+/** @brief Sanity ceiling (16G elements) rejecting uninitialized stack container headers. */
+constexpr uint64_t kMaxSanityElements = (1ULL << 34);
+
 [[nodiscard]] constexpr const char* numericKindLabel(NumericKind kind) noexcept {
   switch (kind) {
     case NumericKind::Float32:
@@ -115,6 +126,40 @@ enum class NumericKind : uint8_t {
       return "u64";
   }
   return "f64";
+}
+
+[[nodiscard]] constexpr const char* numericKindCppName(NumericKind kind) noexcept {
+  switch (kind) {
+    case NumericKind::Float32:
+      return "float";
+    case NumericKind::Float64:
+      return "double";
+    case NumericKind::Int32:
+      return "int32_t";
+    case NumericKind::UInt32:
+      return "uint32_t";
+    case NumericKind::Int64:
+      return "int64_t";
+    case NumericKind::UInt64:
+      return "uint64_t";
+  }
+  return "double";
+}
+
+[[nodiscard]] constexpr const char* containerFamilyCppPrefix(ContainerFamily family) noexcept {
+  switch (family) {
+    case ContainerFamily::StdVector:
+      return "std::vector";
+    case ContainerFamily::StdArray:
+      return "std::array";
+    case ContainerFamily::StdValarray:
+      return "std::valarray";
+    case ContainerFamily::StdSpan:
+      return "std::span";
+    case ContainerFamily::Unknown:
+      return "std::vector";
+  }
+  return "std::vector";
 }
 
 struct SummaryStats {
@@ -331,65 +376,169 @@ enum class TriggerMode : uint8_t {
   return haystack.find(needle) != std::string_view::npos;
 }
 
+[[nodiscard]] ContainerFamily classifyContainerFamily(std::string_view typeHint) noexcept {
+  const std::size_t openAngle = typeHint.find('<');
+  const std::string_view outer =
+      (openAngle != std::string_view::npos) ? typeHint.substr(0u, openAngle) : typeHint;
+  if (containsSubstr(outer, "valarray")) {
+    return ContainerFamily::StdValarray;
+  }
+  if (containsSubstr(outer, "array")) {
+    return ContainerFamily::StdArray;
+  }
+  if (containsSubstr(outer, "vector")) {
+    return ContainerFamily::StdVector;
+  }
+  if (containsSubstr(outer, "span")) {
+    return ContainerFamily::StdSpan;
+  }
+  return ContainerFamily::Unknown;
+}
+
+/**
+ * @brief Extracts the first template type parameter (`std::vector<double, ...>` -> `"double"`).
+ */
+[[nodiscard]] std::string_view extractFirstTemplateArg(std::string_view typeText) noexcept {
+  const std::size_t openPos = typeText.find('<');
+  if (openPos == std::string_view::npos) {
+    return typeText;
+  }
+  int depth = 0;
+  for (std::size_t i = openPos + 1u; i < typeText.size(); ++i) {
+    const char ch = typeText[i];
+    if (ch == '<') {
+      ++depth;
+    } else if (ch == '>') {
+      if (depth == 0) {
+        return trimAscii(typeText.substr(openPos + 1u, i - (openPos + 1u)));
+      }
+      --depth;
+    } else if (ch == ',' && depth == 0) {
+      return trimAscii(typeText.substr(openPos + 1u, i - (openPos + 1u)));
+    }
+  }
+  return typeText.substr(openPos + 1u);
+}
+
 [[nodiscard]] NumericKind classifyTypeString(
     std::string_view typeText,
     bool* outMatched) noexcept {
-  *outMatched = true;
-  if (containsSubstr(typeText, "double")) {
+  const std::string_view elemType = extractFirstTemplateArg(typeText);
+  // Reject nested templates (e.g. std::vector<std::vector<double>>) and string/char/bool types.
+  if (containsSubstr(elemType, "<") || containsSubstr(elemType, "string") ||
+      containsSubstr(elemType, "char") || containsSubstr(elemType, "bool")) {
+    *outMatched = false;
     return NumericKind::Float64;
   }
-  if (containsSubstr(typeText, "float")) {
+
+  *outMatched = true;
+  if (containsSubstr(elemType, "double")) {
+    return NumericKind::Float64;
+  }
+  if (containsSubstr(elemType, "float")) {
     return NumericKind::Float32;
   }
-  if (containsSubstr(typeText, "uint64") || containsSubstr(typeText, "size_t") ||
-      containsSubstr(typeText, "unsigned long")) {
+  if (containsSubstr(elemType, "uint64") || containsSubstr(elemType, "size_t") ||
+      containsSubstr(elemType, "unsigned long")) {
     return NumericKind::UInt64;
   }
-  if (containsSubstr(typeText, "int64") || containsSubstr(typeText, "ptrdiff_t") ||
-      containsSubstr(typeText, "ssize_t") || containsSubstr(typeText, "long")) {
+  if (containsSubstr(elemType, "int64") || containsSubstr(elemType, "ptrdiff_t") ||
+      containsSubstr(elemType, "ssize_t") || containsSubstr(elemType, "long")) {
     return NumericKind::Int64;
   }
-  if (containsSubstr(typeText, "uint32") || containsSubstr(typeText, "unsigned")) {
+  if (containsSubstr(elemType, "uint32") || containsSubstr(elemType, "unsigned")) {
     return NumericKind::UInt32;
   }
-  if (containsSubstr(typeText, "int32") || containsSubstr(typeText, "int")) {
+  if (containsSubstr(elemType, "int32") || containsSubstr(elemType, "int")) {
     return NumericKind::Int32;
   }
   *outMatched = false;
   return NumericKind::Float64;
 }
 
-[[nodiscard]] NumericKind detectNumericKind(
+/**
+ * @brief Classifies an element lvalue via pure DWARF `sizeof` + `__typeof__` (zero function calls,
+ *        safe even on null/empty container pointers because `sizeof` and `__typeof__` are unevaluated).
+ */
+[[nodiscard]] std::expected<NumericKind, GridLockStatus> classifyElementDwarfLvalue(
     const GridLockHostApi* host,
     int32_t rank,
-    std::string_view expr,
-    std::string_view typeHint,
-    std::string_view dataEvalOutput) noexcept {
-  bool matched = false;
-  if (!typeHint.empty()) {
-    const NumericKind fromHint = classifyTypeString(typeHint, &matched);
-    if (matched) {
-      return fromHint;
-    }
+    std::string_view elemLvalueExpr) noexcept {
+  const std::string elem(elemLvalueExpr);
+  const std::string probeExpr =
+      "(int)sizeof(" + elem + ") * 4 + (((__typeof__(" + elem +
+      "))1) / 2 != 0 ? 2 : (((__typeof__(" + elem + "))-1) < 0 ? 1 : 0))";
+  const auto res = gp::evalExpr(host, rank, probeExpr);
+  if (!res.has_value()) {
+    return std::unexpected(res.error());
   }
-  if (!dataEvalOutput.empty()) {
-    const NumericKind fromData = classifyTypeString(dataEvalOutput, &matched);
-    if (matched) {
-      return fromData;
-    }
+  uint64_t code = 0u;
+  if (!parseUnsigned64(*res, &code)) {
+    return std::unexpected(GRIDLOCK_ERR_EVAL_FAILED);
   }
-
-  const std::string sizeofExpr =
-      needsParentheses(expr)
-          ? ("sizeof(*((" + std::string(expr) + ").data()))")
-          : ("sizeof(*(" + std::string(expr) + ".data()))");
-  if (const auto elemBytesRes = gp::evalExpr(host, rank, sizeofExpr); elemBytesRes.has_value()) {
-    uint64_t elemSize = 0u;
-    if (parseUnsigned64(*elemBytesRes, &elemSize) && elemSize == sizeof(float)) {
+  switch (code) {
+    case 34u:
+      return NumericKind::Float64;
+    case 18u:
       return NumericKind::Float32;
-    }
+    case 33u:
+      return NumericKind::Int64;
+    case 32u:
+      return NumericKind::UInt64;
+    case 17u:
+      return NumericKind::Int32;
+    case 16u:
+      return NumericKind::UInt32;
+    default:
+      return std::unexpected(GRIDLOCK_ERR_EVAL_FAILED);
   }
-  return NumericKind::Float64;
+}
+
+[[nodiscard]] constexpr std::size_t numericKindByteSize(NumericKind kind) noexcept {
+  switch (kind) {
+    case NumericKind::Float32:
+    case NumericKind::Int32:
+    case NumericKind::UInt32:
+      return 4u;
+    case NumericKind::Float64:
+    case NumericKind::Int64:
+    case NumericKind::UInt64:
+      return 8u;
+  }
+  return 8u;
+}
+
+/**
+ * @brief Parses an unsigned 64-bit integer (decimal or `0x` hex) immediately following `prefix`.
+ */
+[[nodiscard]] bool parseFieldAfterPrefix(
+    std::string_view text,
+    std::string_view prefix,
+    uint64_t* outValue) noexcept {
+  if (outValue == nullptr) {
+    return false;
+  }
+  const std::size_t pos = text.find(prefix);
+  if (pos == std::string_view::npos) {
+    return false;
+  }
+  std::string_view tail = text.substr(pos + prefix.size());
+  while (!tail.empty() && (tail.front() == ' ' || tail.front() == '\t')) {
+    tail.remove_prefix(1);
+  }
+  int base = 10;
+  if (tail.size() > 2u && tail[0] == '0' && (tail[1] == 'x' || tail[1] == 'X')) {
+    tail.remove_prefix(2);
+    base = 16;
+  }
+  uint64_t parsed = 0u;
+  const auto [ptr, ec] = std::from_chars(tail.data(), tail.data() + tail.size(), parsed, base);
+  (void)ptr;
+  if (ec != std::errc{}) {
+    return false;
+  }
+  *outValue = parsed;
+  return true;
 }
 
 [[nodiscard]] std::string escapeJson(std::string_view input) {
@@ -540,6 +689,13 @@ template <typename Elem>
   return reduceSpan<Elem>(std::span<const Elem>(buffer.data(), elemsRead), totalCount, kind);
 }
 
+struct ResolvedContainer {
+  uint64_t total_count = 0u;
+  uint64_t data_addr = 0u;
+  NumericKind kind = NumericKind::Float64;
+  ContainerFamily family = ContainerFamily::Unknown;
+};
+
 [[nodiscard]] bool isUnsupportedStringContainer(
     std::string_view typeHint,
     std::string_view dataEvalOutput) noexcept {
@@ -561,39 +717,336 @@ template <typename Elem>
     return std::unexpected(res.error());
   }
   uint64_t numBytes = 0u;
-  // Reject 0 and 1-byte GNU function sizeof values (all supported numeric containers are >= 4 B).
   if (!parseUnsigned64(*res, &numBytes) || numBytes < sizeof(float)) {
     return std::unexpected(GRIDLOCK_ERR_EVAL_FAILED);
   }
   return numBytes;
 }
 
-[[nodiscard]] std::expected<std::string, GridLockStatus> evalContainerSize(
-    const GridLockHostApi* host,
-    int32_t rank,
-    std::string_view expr) noexcept {
-  const std::string base(expr);
-  const std::string sizeExpr =
-      needsParentheses(expr) ? ("(" + base + ").size()") : (base + ".size()");
-  return gp::evalExpr(host, rank, sizeExpr);
-}
-
-[[nodiscard]] std::expected<std::string, GridLockStatus> evalContainerData(
+/**
+ * @brief Fallback method-based `.size()` / `.data()` resolver used only when DWARF struct fields
+ *        are unavailable (for example, custom container wrappers or synthetic unit-test mocks).
+ */
+[[nodiscard]] std::expected<ResolvedContainer, GridLockStatus> resolveViaMethodsFallback(
     const GridLockHostApi* host,
     int32_t rank,
     std::string_view expr,
     std::string_view typeHint,
-    uint64_t elementCount) noexcept {
-  const std::string base(expr);
-  if (containsSubstr(typeHint, "valarray")) {
-    if (elementCount == 0u) {
-      return std::string("0x0");
-    }
-    return gp::evalExpr(host, rank, "&((" + base + ")[0])");
+    ContainerFamily family,
+    NumericKind defaultKind,
+    bool hasKnownKind) noexcept {
+  const auto objBytesRes = evalObjectByteSize(host, rank, expr);
+  if (!objBytesRes.has_value()) {
+    return std::unexpected(objBytesRes.error());
   }
+
+  const std::string base =
+      needsParentheses(expr) ? ("(" + std::string(expr) + ")") : std::string(expr);
+  const auto sizeRes = gp::evalExpr(host, rank, base + ".size()");
+  if (!sizeRes.has_value()) {
+    return std::unexpected(sizeRes.error());
+  }
+
+  uint64_t totalCount = 0u;
+  if (!parseUnsigned64(*sizeRes, &totalCount) || totalCount > kMaxSanityElements) {
+    return std::unexpected(GRIDLOCK_ERR_EVAL_FAILED);
+  }
+
   const std::string dataExpr =
-      needsParentheses(expr) ? ("(" + base + ").data()") : (base + ".data()");
-  return gp::evalExpr(host, rank, dataExpr);
+      (family == ContainerFamily::StdValarray)
+          ? ((totalCount > 0u) ? ("&((" + base + ")[0])") : std::string{})
+          : (base + ".data()");
+
+  uint64_t dataAddr = 0u;
+  NumericKind resolvedKind = defaultKind;
+  if (!dataExpr.empty()) {
+    const auto dataRes = gp::evalExpr(host, rank, dataExpr);
+    if (!dataRes.has_value()) {
+      return std::unexpected(dataRes.error());
+    }
+    if (isUnsupportedStringContainer(typeHint, *dataRes)) {
+      return std::unexpected(GRIDLOCK_ERR_EVAL_FAILED);
+    }
+    if (!hasKnownKind) {
+      bool matched = false;
+      const NumericKind fromPtr = classifyTypeString(*dataRes, &matched);
+      if (matched) {
+        resolvedKind = fromPtr;
+      }
+    }
+    if (totalCount > 0u && (!parseUnsigned64(*dataRes, &dataAddr) || dataAddr == 0u)) {
+      return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+    }
+  }
+
+  return ResolvedContainer{
+      totalCount,
+      dataAddr,
+      resolvedKind,
+      (family == ContainerFamily::Unknown) ? ContainerFamily::StdVector : family};
+}
+
+/**
+ * @brief Resolves container length, element data address, and element numeric type using pure
+ *        DWARF struct member expressions first (zero inferior function calls — immune to GCC/Clang
+ *        inlining or uninstantiated `.data()` / `.size()` templates), falling back cleanly to
+ *        method calls only for non-standard or mock hosts.
+ */
+[[nodiscard]] std::expected<ResolvedContainer, GridLockStatus> resolveContainerLayout(
+    const GridLockHostApi* host,
+    int32_t rank,
+    std::string_view expr,
+    std::string_view typeHint) noexcept {
+  const std::string base =
+      needsParentheses(expr) ? ("(" + std::string(expr) + ")") : std::string(expr);
+  const bool isLibcxx = containsSubstr(typeHint, "std::__1::");
+
+  ContainerFamily family = classifyContainerFamily(typeHint);
+  bool hasKnownKind = false;
+  NumericKind kind = NumericKind::Float64;
+  if (!typeHint.empty()) {
+    kind = classifyTypeString(typeHint, &hasKnownKind);
+    if (!hasKnownKind) {
+      return std::unexpected(GRIDLOCK_ERR_EVAL_FAILED);
+    }
+  }
+
+  // Fast path 1: Container family & element type already known from Variables Dock / cached hint.
+  if (family != ContainerFamily::Unknown && hasKnownKind) {
+    if (family == ContainerFamily::StdVector) {
+      const std::string lenExpr =
+          isLibcxx ? (base + ".__end_ - " + base + ".__begin_")
+                   : (base + "._M_impl._M_finish - " + base + "._M_impl._M_start");
+      const std::string ptrExpr =
+          isLibcxx ? (base + ".__begin_") : (base + "._M_impl._M_start");
+      if (const auto lenRes = gp::evalExpr(host, rank, lenExpr); lenRes.has_value()) {
+        uint64_t count = 0u;
+        if (!parseUnsigned64(*lenRes, &count) || count > kMaxSanityElements) {
+          return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+        }
+        uint64_t addr = 0u;
+        if (count > 0u) {
+          const auto ptrRes = gp::evalExpr(host, rank, ptrExpr);
+          if (!ptrRes.has_value() || !parseUnsigned64(*ptrRes, &addr) || addr == 0u) {
+            return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+          }
+        }
+        return ResolvedContainer{count, addr, kind, family};
+      }
+      return resolveViaMethodsFallback(host, rank, expr, typeHint, family, kind, true);
+    }
+
+    if (family == ContainerFamily::StdArray) {
+      const std::string elemsField = isLibcxx ? ".__elems_" : "._M_elems";
+      const std::string lenExpr =
+          "sizeof(" + base + elemsField + ") / sizeof(" + base + elemsField + "[0])";
+      if (const auto lenRes = gp::evalExpr(host, rank, lenExpr); lenRes.has_value()) {
+        uint64_t count = 0u;
+        if (!parseUnsigned64(*lenRes, &count) || count > kMaxSanityElements) {
+          return std::unexpected(GRIDLOCK_ERR_EVAL_FAILED);
+        }
+        uint64_t addr = 0u;
+        if (count > 0u) {
+          const auto ptrRes = gp::evalExpr(host, rank, "&(" + base + elemsField + "[0])");
+          if (!ptrRes.has_value() || !parseUnsigned64(*ptrRes, &addr) || addr == 0u) {
+            return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+          }
+        }
+        return ResolvedContainer{count, addr, kind, family};
+      }
+      return resolveViaMethodsFallback(host, rank, expr, typeHint, family, kind, true);
+    }
+
+    if (family == ContainerFamily::StdValarray) {
+      if (!isLibcxx) {
+        if (const auto lenRes = gp::evalExpr(host, rank, base + "._M_size"); lenRes.has_value()) {
+          uint64_t count = 0u;
+          if (!parseUnsigned64(*lenRes, &count) || count > kMaxSanityElements) {
+            return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+          }
+          uint64_t addr = 0u;
+          if (count > 0u) {
+            const auto ptrRes = gp::evalExpr(host, rank, base + "._M_data");
+            if (!ptrRes.has_value() || !parseUnsigned64(*ptrRes, &addr) || addr == 0u) {
+              return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+            }
+          }
+          return ResolvedContainer{count, addr, kind, family};
+        }
+      }
+      return resolveViaMethodsFallback(host, rank, expr, typeHint, family, kind, true);
+    }
+
+    if (family == ContainerFamily::StdSpan) {
+      if (const auto selfRes = gp::evalExpr(host, rank, expr); selfRes.has_value()) {
+        uint64_t count = 0u;
+        const std::string_view sv(*selfRes);
+        if (parseFieldAfterPrefix(sv, "std::span of length ", &count) ||
+            parseFieldAfterPrefix(sv, "_M_extent_value = ", &count) ||
+            parseFieldAfterPrefix(sv, "static extent = ", &count) ||
+            parseFieldAfterPrefix(sv, "__size_ = ", &count)) {
+          if (count > kMaxSanityElements) {
+            return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+          }
+          uint64_t addr = 0u;
+          if (count > 0u) {
+            if (!parseFieldAfterPrefix(sv, "_M_ptr = ", &addr) &&
+                !parseFieldAfterPrefix(sv, "__data_ = ", &addr)) {
+              const std::string ptrExpr = isLibcxx ? (base + ".__data_") : (base + "._M_ptr");
+              const auto ptrRes = gp::evalExpr(host, rank, ptrExpr);
+              if (!ptrRes.has_value() || !parseUnsigned64(*ptrRes, &addr) || addr == 0u) {
+                return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+              }
+            }
+          }
+          return ResolvedContainer{count, addr, kind, family};
+        }
+      }
+      return resolveViaMethodsFallback(host, rank, expr, typeHint, family, kind, true);
+    }
+  }
+
+  // Path 2: Untyped expression (e.g. Source Editor selection/symbol or interactive prompt).
+  // Evaluate `<expr>` once to inspect GDB's pretty-printer or DWARF struct summary without calling methods.
+  const auto selfRes = gp::evalExpr(host, rank, expr);
+  if (!selfRes.has_value()) {
+    // Only fall back to sizeof/methods if the host is a synthetic mock that doesn't evaluate bare names.
+    return resolveViaMethodsFallback(host, rank, expr, typeHint, family, kind, hasKnownKind);
+  }
+
+  const std::string_view sv = trimAscii(*selfRes);
+  // Immediately reject bound methods / function pointers (e.g. `{void (std::vector<...>::*)(...)} 0x400f02 <...>`)
+  if ((sv.starts_with('{') && containsSubstr(sv, ") ") && containsSubstr(sv, "0x")) ||
+      (containsSubstr(sv, ">::") && containsSubstr(sv, "0x") && containsSubstr(sv, "<"))) {
+    return std::unexpected(GRIDLOCK_ERR_EVAL_FAILED);
+  }
+
+  // 2a: Pretty-printed libstdc++ std::vector ("std::vector of length N, capacity C = {...}")
+  uint64_t count = 0u;
+  if (parseFieldAfterPrefix(sv, "std::vector of length ", &count)) {
+    if (count > kMaxSanityElements) {
+      return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+    }
+    const auto elemKindRes =
+        classifyElementDwarfLvalue(host, rank, "*(" + base + "._M_impl._M_start)");
+    if (!elemKindRes.has_value()) {
+      return std::unexpected(elemKindRes.error());
+    }
+    uint64_t addr = 0u;
+    if (count > 0u) {
+      const auto ptrRes = gp::evalExpr(host, rank, base + "._M_impl._M_start");
+      if (!ptrRes.has_value() || !parseUnsigned64(*ptrRes, &addr) || addr == 0u) {
+        return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+      }
+    }
+    return ResolvedContainer{count, addr, *elemKindRes, ContainerFamily::StdVector};
+  }
+
+  // 2b: Raw libstdc++ std::vector ("{... _M_start = 0x..., _M_finish = 0x...}")
+  uint64_t startAddr = 0u;
+  uint64_t finishAddr = 0u;
+  if (parseFieldAfterPrefix(sv, "_M_start = ", &startAddr) &&
+      parseFieldAfterPrefix(sv, "_M_finish = ", &finishAddr)) {
+    if (finishAddr < startAddr) {
+      return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+    }
+    const auto elemKindRes =
+        classifyElementDwarfLvalue(host, rank, "*(" + base + "._M_impl._M_start)");
+    if (!elemKindRes.has_value()) {
+      return std::unexpected(elemKindRes.error());
+    }
+    const uint64_t elemBytes = numericKindByteSize(*elemKindRes);
+    const uint64_t elemCount = (finishAddr - startAddr) / elemBytes;
+    if (elemCount > kMaxSanityElements || (elemCount > 0u && startAddr == 0u)) {
+      return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+    }
+    return ResolvedContainer{elemCount, startAddr, *elemKindRes, ContainerFamily::StdVector};
+  }
+
+  // 2c: Pretty-printed or raw libstdc++ std::span
+  if (parseFieldAfterPrefix(sv, "std::span of length ", &count) ||
+      (containsSubstr(sv, "_M_ptr = ") &&
+       (parseFieldAfterPrefix(sv, "_M_extent_value = ", &count) ||
+        parseFieldAfterPrefix(sv, "static extent = ", &count)))) {
+    if (count > kMaxSanityElements) {
+      return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+    }
+    const auto elemKindRes = classifyElementDwarfLvalue(host, rank, "*(" + base + "._M_ptr)");
+    if (!elemKindRes.has_value()) {
+      return std::unexpected(elemKindRes.error());
+    }
+    uint64_t addr = 0u;
+    if (count > 0u) {
+      if (!parseFieldAfterPrefix(sv, "_M_ptr = ", &addr)) {
+        const auto ptrRes = gp::evalExpr(host, rank, base + "._M_ptr");
+        if (!ptrRes.has_value() || !parseUnsigned64(*ptrRes, &addr)) {
+          return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+        }
+      }
+      if (addr == 0u) {
+        return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+      }
+    }
+    return ResolvedContainer{count, addr, *elemKindRes, ContainerFamily::StdSpan};
+  }
+
+  // 2d: libstdc++ std::valarray ("{_M_size = N, _M_data = 0x...}")
+  uint64_t vaAddr = 0u;
+  if (parseFieldAfterPrefix(sv, "_M_size = ", &count) &&
+      parseFieldAfterPrefix(sv, "_M_data = ", &vaAddr)) {
+    if (count > kMaxSanityElements || (count > 0u && vaAddr == 0u)) {
+      return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+    }
+    const auto elemKindRes = classifyElementDwarfLvalue(host, rank, "*(" + base + "._M_data)");
+    if (!elemKindRes.has_value()) {
+      return std::unexpected(elemKindRes.error());
+    }
+    return ResolvedContainer{count, vaAddr, *elemKindRes, ContainerFamily::StdValarray};
+  }
+
+  // 2e: libstdc++ / libc++ std::array ("{_M_elems = {...}}" or "{__elems_ = {...}}")
+  if (containsSubstr(sv, "_M_elems =") || containsSubstr(sv, "__elems_ =")) {
+    const std::string elemsField = containsSubstr(sv, "__elems_ =") ? ".__elems_" : "._M_elems";
+    const auto elemKindRes =
+        classifyElementDwarfLvalue(host, rank, "(" + base + elemsField + "[0])");
+    if (!elemKindRes.has_value()) {
+      return std::unexpected(elemKindRes.error());
+    }
+    const auto lenRes = gp::evalExpr(
+        host, rank, "sizeof(" + base + elemsField + ") / sizeof(" + base + elemsField + "[0])");
+    if (!lenRes.has_value() || !parseUnsigned64(*lenRes, &count) || count > kMaxSanityElements) {
+      return std::unexpected(GRIDLOCK_ERR_EVAL_FAILED);
+    }
+    uint64_t addr = 0u;
+    if (count > 0u) {
+      const auto ptrRes = gp::evalExpr(host, rank, "&(" + base + elemsField + "[0])");
+      if (!ptrRes.has_value() || !parseUnsigned64(*ptrRes, &addr) || addr == 0u) {
+        return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+      }
+    }
+    return ResolvedContainer{count, addr, *elemKindRes, ContainerFamily::StdArray};
+  }
+
+  // 2f: Raw libc++ std::vector / std::span
+  if (parseFieldAfterPrefix(sv, "__begin_ = ", &startAddr) &&
+      parseFieldAfterPrefix(sv, "__end_ = ", &finishAddr)) {
+    if (finishAddr < startAddr) {
+      return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+    }
+    const auto elemKindRes = classifyElementDwarfLvalue(host, rank, "*(" + base + ".__begin_)");
+    if (!elemKindRes.has_value()) {
+      return std::unexpected(elemKindRes.error());
+    }
+    const uint64_t elemCount = (finishAddr - startAddr) / numericKindByteSize(*elemKindRes);
+    if (elemCount > kMaxSanityElements || (elemCount > 0u && startAddr == 0u)) {
+      return std::unexpected(GRIDLOCK_ERR_MEMORY_READ_FAILED);
+    }
+    return ResolvedContainer{elemCount, startAddr, *elemKindRes, ContainerFamily::StdVector};
+  }
+
+  // Value evaluated cleanly in GDB, but is a plain scalar (e.g. `170`), pointer, string, or non-STL struct.
+  // Reject immediately without issuing failing `.size()` / `.data()` queries!
+  return std::unexpected(GRIDLOCK_ERR_EVAL_FAILED);
 }
 
 [[nodiscard]] std::string buildMarkdownReport(
@@ -820,7 +1273,8 @@ void publishSummary(
     int32_t rank,
     std::string_view rawExpr,
     std::string_view typeHint,
-    TriggerMode mode) {
+    TriggerMode mode,
+    std::string* outResolvedTypeHint = nullptr) {
   const std::string_view expr = trimAscii(rawExpr);
   if (host == nullptr || expr.empty()) {
     return GRIDLOCK_ERR_INVALID_ARG;
@@ -828,47 +1282,30 @@ void publishSummary(
   if (rank < 0) {
     return GRIDLOCK_ERR_INVALID_RANK;
   }
-
   if (isNonVariableKeyword(expr) || isUnsupportedStringContainer(typeHint, std::string_view{})) {
     return GRIDLOCK_ERR_EVAL_FAILED;
   }
 
-  // Gate on sizeof(<expr>) first so member functions (e.g. domain.swap), free functions,
-  // and void/invalid expressions fail immediately without evaluating .size() or .data().
-  const auto objBytesRes = evalObjectByteSize(host, rank, expr);
-  if (!objBytesRes.has_value()) {
-    return objBytesRes.error();
+  const auto layoutRes = resolveContainerLayout(host, rank, expr, typeHint);
+  if (!layoutRes.has_value()) {
+    return layoutRes.error();
   }
 
-  const auto sizeStrRes = evalContainerSize(host, rank, expr);
-  if (!sizeStrRes.has_value()) {
-    return sizeStrRes.error();
-  }
-
-  uint64_t totalCount = 0u;
-  if (!parseUnsigned64(*sizeStrRes, &totalCount)) {
-    return GRIDLOCK_ERR_EVAL_FAILED;
-  }
-
-  const auto dataStrRes = evalContainerData(host, rank, expr, typeHint, totalCount);
-  if (!dataStrRes.has_value()) {
-    return dataStrRes.error();
-  }
-
-  uint64_t dataAddr = 0u;
-  const std::string_view dataView(*dataStrRes);
-  if (isUnsupportedStringContainer(typeHint, dataView)) {
-    return GRIDLOCK_ERR_EVAL_FAILED;
-  }
-  if (totalCount > 0u) {
-    if (!parseUnsigned64(dataView, &dataAddr) || dataAddr == 0u) {
-      return GRIDLOCK_ERR_MEMORY_READ_FAILED;
-    }
-  }
-
-  const NumericKind kind = detectNumericKind(host, rank, expr, typeHint, dataView);
+  const uint64_t totalCount = layoutRes->total_count;
+  const uint64_t dataAddr = layoutRes->data_addr;
+  const NumericKind kind = layoutRes->kind;
   const std::size_t targetCount =
       (totalCount > kMaxSampleElements) ? kMaxSampleElements : static_cast<std::size_t>(totalCount);
+
+  if (outResolvedTypeHint != nullptr) {
+    if (!typeHint.empty()) {
+      outResolvedTypeHint->assign(typeHint);
+    } else {
+      *outResolvedTypeHint =
+          std::string(containerFamilyCppPrefix(layoutRes->family)) + "<" +
+          numericKindCppName(kind) + ">";
+    }
+  }
 
   SummaryStats stats{};
   stats.total_count = totalCount;
@@ -1067,16 +1504,18 @@ GridLockStatus GRIDLOCK_CALL onContextSurfaceAction(
       return GRIDLOCK_OK;
     }
 
+    std::string resolvedHint;
     const GridLockStatus st = inspectContainerAndPublish(
         state,
         host,
         rank,
         candidateExpr,
         candidateTypeHint,
-        TriggerMode::InteractiveUser);
+        TriggerMode::InteractiveUser,
+        &resolvedHint);
     if (st == GRIDLOCK_OK) {
       state->tracked_expr = std::move(candidateExpr);
-      state->tracked_type_hint = std::move(candidateTypeHint);
+      state->tracked_type_hint = std::move(resolvedHint);
       return GRIDLOCK_OK;
     }
 
@@ -1135,16 +1574,18 @@ GridLockStatus GRIDLOCK_CALL onCommandAction(
     }
 
     if (!candidateExpr.empty()) {
+      std::string resolvedHint;
       const GridLockStatus st = inspectContainerAndPublish(
           state,
           host,
           rank,
           candidateExpr,
           candidateTypeHint,
-          TriggerMode::InteractiveUser);
+          TriggerMode::InteractiveUser,
+          &resolvedHint);
       if (st == GRIDLOCK_OK) {
         state->tracked_expr = std::move(candidateExpr);
-        state->tracked_type_hint = std::move(candidateTypeHint);
+        state->tracked_type_hint = std::move(resolvedHint);
       } else if (!hasExplicitArg) {
         state->tracked_expr.clear();
         state->tracked_type_hint.clear();
@@ -1216,11 +1657,18 @@ GridLockStatus GRIDLOCK_CALL onMenuInspectExpression(
     }
 
     const std::string candidateExpr(expr);
+    std::string resolvedHint;
     const GridLockStatus st = inspectContainerAndPublish(
-        state, host, rank, candidateExpr, std::string_view{}, TriggerMode::InteractiveUser);
+        state,
+        host,
+        rank,
+        candidateExpr,
+        std::string_view{},
+        TriggerMode::InteractiveUser,
+        &resolvedHint);
     if (st == GRIDLOCK_OK) {
       state->tracked_expr = candidateExpr;
-      state->tracked_type_hint.clear();
+      state->tracked_type_hint = std::move(resolvedHint);
       return GRIDLOCK_OK;
     }
     if (host->show_toast != nullptr) {

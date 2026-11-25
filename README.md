@@ -10,7 +10,7 @@ Out-of-tree **C++23 native plugin** for the **GridLock** MPI debugger (`C99 ABI 
 
 - **Variables Dock Context Action (`register_variable_action`)**:
   - Registers **"Compute Vector Summary Stats (Min / Max / Mean / L2)"** for variables matching `.*(std::vector|std::array|std::valarray|std::span).*`.
-  - Evaluates `<expr>.size()` and `<expr>.data()` (with `&(<expr>[0])` fallback for `std::valarray`) via `gridlock::plugin::evalExpr` and samples up to `1024` numeric elements (`f32`, `f64`, `i32`, `u32`, `i64`, `u64`) via `gridlock::plugin::readBytes`.
+  - Resolves container length, data pointer, and element type directly from DWARF struct members (`_M_impl._M_start` / `_M_finish`, `_M_elems`, `_M_size` / `_M_data`, `_M_ptr`, and `libc++` equivalents, with `.size()` / `.data()` fallback) so inspection works with **zero inferior function calls** even when `.data()` or `.size()` is inlined or uninstantiated, sampling up to `1024` numeric elements (`f32`, `f64`, `i32`, `u32`, `i64`, `u64`) via `gridlock::plugin::readBytes`.
 - **`Tools -> Plugins` Commands & Nested Submenu (`register_command_action` / `register_menu_action`)**:
   - **"STL Inspector: Summarize Active Rank Stop"**: Recomputes summary statistics for the tracked container on the focused MPI rank (or logs current stop status when idle).
   - **"STL Inspector / Inspect Container Expression..."** (`Ctrl+Alt+Shift+S`): Prompts interactively via `gridlock::plugin::promptInput` for any C++ container expression.
