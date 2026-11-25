@@ -135,6 +135,7 @@ struct SummaryStats {
 struct PluginState {
   std::string tracked_expr;
   std::string tracked_type_hint;
+  std::string last_inspected_expr;
   std::string last_stop_reason;
   std::string last_stop_file;
   std::string last_stop_function;
@@ -201,6 +202,84 @@ enum class TriggerMode : uint8_t {
     }
   }
   return false;
+}
+
+[[nodiscard]] bool isKnownContainerMethod(std::string_view member) noexcept {
+  static constexpr std::string_view kMethods[] = {
+      "swap",       "push_back", "emplace_back", "pop_back",      "resize",
+      "reserve",    "clear",     "shrink_to_fit","begin",         "end",
+      "cbegin",     "cend",      "rbegin",       "rend",          "crbegin",
+      "crend",      "size",      "ssize",        "max_size",      "capacity",
+      "empty",      "data",      "front",        "back",          "at",
+      "assign",     "insert",    "erase",        "emplace",       "subspan",
+      "first",      "last",      "get_allocator",
+  };
+  for (const std::string_view m : kMethods) {
+    if (member == m) {
+      return true;
+    }
+  }
+  return false;
+}
+
+[[nodiscard]] bool isNonVariableKeyword(std::string_view token) noexcept {
+  static constexpr std::string_view kKeywords[] = {
+      "auto",     "bool",     "break",    "case",     "catch",    "char",
+      "class",    "const",    "constexpr","continue", "default",  "delete",
+      "do",       "double",   "else",     "enum",     "explicit", "extern",
+      "false",    "float",    "for",      "friend",   "goto",     "if",
+      "inline",   "int",      "long",     "namespace","new",      "noexcept",
+      "nullptr",  "operator", "private",  "protected","public",   "return",
+      "short",    "signed",   "sizeof",   "static",   "std",      "struct",
+      "switch",   "template", "this",     "throw",    "true",     "try",
+      "typedef",  "typename", "union",    "unsigned", "using",    "virtual",
+      "void",     "volatile", "while",
+  };
+  for (const std::string_view kw : kKeywords) {
+    if (token == kw) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * @brief Normalizes an unhighlighted editor cursor symbol, stripping trailing `.method` / `->method`.
+ */
+[[nodiscard]] std::string_view normalizeEditorSymbol(std::string_view raw) noexcept {
+  std::string_view sym = trimAscii(raw);
+  while (!sym.empty() && sym.back() == ';') {
+    sym = trimAscii(sym.substr(0u, sym.size() - 1u));
+  }
+  // Strip trailing call parentheses if empty `()` was captured on a zero-arg method like `v.clear()`.
+  if (sym.size() > 2u && sym.ends_with("()")) {
+    sym = trimAscii(sym.substr(0u, sym.size() - 2u));
+  }
+
+  std::size_t sepPos = std::string_view::npos;
+  std::size_t sepLen = 0u;
+  const std::size_t arrowPos = sym.rfind("->");
+  const std::size_t dotPos = sym.rfind('.');
+  if (arrowPos != std::string_view::npos &&
+      (dotPos == std::string_view::npos || arrowPos > dotPos)) {
+    sepPos = arrowPos;
+    sepLen = 2u;
+  } else if (dotPos != std::string_view::npos) {
+    sepPos = dotPos;
+    sepLen = 1u;
+  }
+
+  if (sepPos != std::string_view::npos && sepPos > 0u) {
+    const std::string_view trailing = sym.substr(sepPos + sepLen);
+    if (isKnownContainerMethod(trailing)) {
+      sym = trimAscii(sym.substr(0u, sepPos));
+    }
+  }
+
+  if (isNonVariableKeyword(sym)) {
+    return std::string_view{};
+  }
+  return sym;
 }
 
 /**
@@ -461,41 +540,60 @@ template <typename Elem>
   return reduceSpan<Elem>(std::span<const Elem>(buffer.data(), elemsRead), totalCount, kind);
 }
 
+[[nodiscard]] bool isUnsupportedStringContainer(
+    std::string_view typeHint,
+    std::string_view dataEvalOutput) noexcept {
+  return containsSubstr(typeHint, "basic_string") ||
+         containsSubstr(typeHint, "string_view") ||
+         containsSubstr(dataEvalOutput, "char *") ||
+         containsSubstr(dataEvalOutput, "char*");
+}
+
+[[nodiscard]] std::expected<uint64_t, GridLockStatus> evalObjectByteSize(
+    const GridLockHostApi* host,
+    int32_t rank,
+    std::string_view expr) noexcept {
+  const std::string base(expr);
+  const std::string sizeofExpr =
+      needsParentheses(expr) ? ("sizeof((" + base + "))") : ("sizeof(" + base + ")");
+  const auto res = gp::evalExpr(host, rank, sizeofExpr);
+  if (!res.has_value()) {
+    return std::unexpected(res.error());
+  }
+  uint64_t numBytes = 0u;
+  // Reject 0 and 1-byte GNU function sizeof values (all supported numeric containers are >= 4 B).
+  if (!parseUnsigned64(*res, &numBytes) || numBytes < sizeof(float)) {
+    return std::unexpected(GRIDLOCK_ERR_EVAL_FAILED);
+  }
+  return numBytes;
+}
+
 [[nodiscard]] std::expected<std::string, GridLockStatus> evalContainerSize(
     const GridLockHostApi* host,
     int32_t rank,
     std::string_view expr) noexcept {
   const std::string base(expr);
-  if (!needsParentheses(expr)) {
-    auto direct = gp::evalExpr(host, rank, base + ".size()");
-    if (direct.has_value()) {
-      return direct;
-    }
-  }
-  return gp::evalExpr(host, rank, "(" + base + ").size()");
+  const std::string sizeExpr =
+      needsParentheses(expr) ? ("(" + base + ").size()") : (base + ".size()");
+  return gp::evalExpr(host, rank, sizeExpr);
 }
 
 [[nodiscard]] std::expected<std::string, GridLockStatus> evalContainerData(
     const GridLockHostApi* host,
     int32_t rank,
     std::string_view expr,
+    std::string_view typeHint,
     uint64_t elementCount) noexcept {
   const std::string base(expr);
-  if (!needsParentheses(expr)) {
-    auto direct = gp::evalExpr(host, rank, base + ".data()");
-    if (direct.has_value()) {
-      return direct;
+  if (containsSubstr(typeHint, "valarray")) {
+    if (elementCount == 0u) {
+      return std::string("0x0");
     }
-  }
-  auto parenthesized = gp::evalExpr(host, rank, "(" + base + ").data()");
-  if (parenthesized.has_value()) {
-    return parenthesized;
-  }
-  if (elementCount > 0u) {
-    // Fallback for std::valarray<T>, which lacks .data() in ISO C++ but guarantees contiguous &v[0].
     return gp::evalExpr(host, rank, "&((" + base + ")[0])");
   }
-  return parenthesized;
+  const std::string dataExpr =
+      needsParentheses(expr) ? ("(" + base + ").data()") : (base + ".data()");
+  return gp::evalExpr(host, rank, dataExpr);
 }
 
 [[nodiscard]] std::string buildMarkdownReport(
@@ -628,6 +726,7 @@ void publishSummary(
 
   state->last_stats = stats;
   state->last_inspected_rank = rank;
+  state->last_inspected_expr.assign(expr);
   state->last_json_payload = jsonPayload;
   state->has_last_stats = true;
 
@@ -730,6 +829,17 @@ void publishSummary(
     return GRIDLOCK_ERR_INVALID_RANK;
   }
 
+  if (isNonVariableKeyword(expr) || isUnsupportedStringContainer(typeHint, std::string_view{})) {
+    return GRIDLOCK_ERR_EVAL_FAILED;
+  }
+
+  // Gate on sizeof(<expr>) first so member functions (e.g. domain.swap), free functions,
+  // and void/invalid expressions fail immediately without evaluating .size() or .data().
+  const auto objBytesRes = evalObjectByteSize(host, rank, expr);
+  if (!objBytesRes.has_value()) {
+    return objBytesRes.error();
+  }
+
   const auto sizeStrRes = evalContainerSize(host, rank, expr);
   if (!sizeStrRes.has_value()) {
     return sizeStrRes.error();
@@ -740,14 +850,16 @@ void publishSummary(
     return GRIDLOCK_ERR_EVAL_FAILED;
   }
 
-  const auto dataStrRes = evalContainerData(host, rank, expr, totalCount);
-  if (!dataStrRes.has_value() && totalCount > 0u) {
+  const auto dataStrRes = evalContainerData(host, rank, expr, typeHint, totalCount);
+  if (!dataStrRes.has_value()) {
     return dataStrRes.error();
   }
 
   uint64_t dataAddr = 0u;
-  const std::string_view dataView =
-      dataStrRes.has_value() ? std::string_view(*dataStrRes) : std::string_view{};
+  const std::string_view dataView(*dataStrRes);
+  if (isUnsupportedStringContainer(typeHint, dataView)) {
+    return GRIDLOCK_ERR_EVAL_FAILED;
+  }
   if (totalCount > 0u) {
     if (!parseUnsigned64(dataView, &dataAddr) || dataAddr == 0u) {
       return GRIDLOCK_ERR_MEMORY_READ_FAILED;
@@ -827,7 +939,7 @@ GridLockStatus GRIDLOCK_CALL onStatusItemClicked(
     }
     if (state->has_last_stats && host->publish_report_view != nullptr) {
       const std::string md = buildMarkdownReport(
-          *state, state->last_inspected_rank, state->tracked_expr, state->last_stats);
+          *state, state->last_inspected_rank, state->last_inspected_expr, state->last_stats);
       (void)host->publish_report_view(
           host->host_ctx,
           kMarkdownPanelId,
@@ -867,18 +979,22 @@ GridLockStatus GRIDLOCK_CALL onVariableAction(
       return GRIDLOCK_ERR_INVALID_ARG;
     }
 
-    const std::string_view typeHint =
-        (varCtx->type_utf8 != nullptr) ? std::string_view(varCtx->type_utf8) : std::string_view{};
-    state->tracked_expr.assign(trimAscii(rawExpr));
-    state->tracked_type_hint.assign(typeHint);
+    const std::string candidateExpr(trimAscii(rawExpr));
+    const std::string candidateTypeHint =
+        (varCtx->type_utf8 != nullptr) ? std::string(varCtx->type_utf8) : std::string{};
 
-    return inspectContainerAndPublish(
+    const GridLockStatus st = inspectContainerAndPublish(
         state,
         host,
         varCtx->rank,
-        state->tracked_expr,
-        state->tracked_type_hint,
+        candidateExpr,
+        candidateTypeHint,
         TriggerMode::InteractiveUser);
+    if (st == GRIDLOCK_OK) {
+      state->tracked_expr = candidateExpr;
+      state->tracked_type_hint = candidateTypeHint;
+    }
+    return st;
   } catch (...) {
     return GRIDLOCK_ERR_UNSUPPORTED;
   }
@@ -905,20 +1021,33 @@ GridLockStatus GRIDLOCK_CALL onContextSurfaceAction(
       return GRIDLOCK_ERR_INVALID_RANK;
     }
 
-    if (surfaceCtx->surface == GRIDLOCK_SURFACE_CODE_EDITOR) {
-      const char* candidate =
-          (surfaceCtx->selected_text_utf8 != nullptr && surfaceCtx->selected_text_utf8[0] != '\0')
-              ? surfaceCtx->selected_text_utf8
-              : surfaceCtx->symbol_utf8;
-      if (candidate == nullptr || candidate[0] == '\0') {
-        return GRIDLOCK_ERR_INVALID_ARG;
-      }
-      const std::string_view cleaned = trimAscii(candidate);
+    std::string candidateExpr = state->tracked_expr;
+    std::string candidateTypeHint = state->tracked_type_hint;
+    const bool fromEditor = (surfaceCtx->surface == GRIDLOCK_SURFACE_CODE_EDITOR);
+
+    if (fromEditor) {
+      const bool hasExplicitSelection =
+          (surfaceCtx->selected_text_utf8 != nullptr &&
+           !trimAscii(surfaceCtx->selected_text_utf8).empty());
+      const std::string_view cleaned =
+          hasExplicitSelection
+              ? trimAscii(surfaceCtx->selected_text_utf8)
+              : ((surfaceCtx->symbol_utf8 != nullptr)
+                     ? normalizeEditorSymbol(surfaceCtx->symbol_utf8)
+                     : std::string_view{});
       if (cleaned.empty()) {
-        return GRIDLOCK_ERR_INVALID_ARG;
+        if (host->show_toast != nullptr) {
+          (void)host->show_toast(
+              host->host_ctx,
+              GRIDLOCK_DIALOG_WARNING,
+              "STL Inspector: Unsupported Symbol",
+              "Selected token is not a C++ STL container object.",
+              3000);
+        }
+        return GRIDLOCK_ERR_EVAL_FAILED;
       }
-      state->tracked_expr.assign(cleaned);
-      state->tracked_type_hint.clear();
+      candidateExpr.assign(cleaned);
+      candidateTypeHint.clear();
     } else if (surfaceCtx->surface == GRIDLOCK_SURFACE_CALL_STACK &&
                surfaceCtx->file_utf8 != nullptr && surfaceCtx->line > 0 &&
                host->navigate_to_location != nullptr) {
@@ -926,7 +1055,7 @@ GridLockStatus GRIDLOCK_CALL onContextSurfaceAction(
       (void)host->navigate_to_location(host->host_ctx, cleanFile.c_str(), surfaceCtx->line, 1);
     }
 
-    if (state->tracked_expr.empty()) {
+    if (candidateExpr.empty()) {
       if (host->show_toast != nullptr) {
         (void)host->show_toast(
             host->host_ctx,
@@ -938,13 +1067,38 @@ GridLockStatus GRIDLOCK_CALL onContextSurfaceAction(
       return GRIDLOCK_OK;
     }
 
-    return inspectContainerAndPublish(
+    const GridLockStatus st = inspectContainerAndPublish(
         state,
         host,
         rank,
-        state->tracked_expr,
-        state->tracked_type_hint,
+        candidateExpr,
+        candidateTypeHint,
         TriggerMode::InteractiveUser);
+    if (st == GRIDLOCK_OK) {
+      state->tracked_expr = std::move(candidateExpr);
+      state->tracked_type_hint = std::move(candidateTypeHint);
+      return GRIDLOCK_OK;
+    }
+
+    // Do not save invalid editor expressions into state->tracked_expr; if an existing tracked_expr
+    // itself failed to evaluate as a container, clear it so onRankStopped stops polling it.
+    if (!fromEditor) {
+      state->tracked_expr.clear();
+      state->tracked_type_hint.clear();
+    }
+    if (host->show_toast != nullptr) {
+      const std::string toastMsg =
+          "'" + sanitizeSingleLine(candidateExpr, 96u) +
+          "' is not an in-scope contiguous numeric STL container on rank " +
+          std::to_string(rank) + ".";
+      (void)host->show_toast(
+          host->host_ctx,
+          GRIDLOCK_DIALOG_WARNING,
+          "STL Inspector: Unsupported Symbol",
+          toastMsg.c_str(),
+          3500);
+    }
+    return st;
   } catch (...) {
     return GRIDLOCK_ERR_UNSUPPORTED;
   }
@@ -968,22 +1122,34 @@ GridLockStatus GRIDLOCK_CALL onCommandAction(
       return GRIDLOCK_ERR_INVALID_RANK;
     }
 
+    std::string candidateExpr = state->tracked_expr;
+    std::string candidateTypeHint = state->tracked_type_hint;
+    bool hasExplicitArg = false;
     if (cmdSpec->args_utf8 != nullptr) {
       const std::string_view trimmedArgs = trimAscii(cmdSpec->args_utf8);
       if (!trimmedArgs.empty()) {
-        state->tracked_expr.assign(trimmedArgs);
-        state->tracked_type_hint.clear();
+        candidateExpr.assign(trimmedArgs);
+        candidateTypeHint.clear();
+        hasExplicitArg = true;
       }
     }
 
-    if (!state->tracked_expr.empty()) {
-      return inspectContainerAndPublish(
+    if (!candidateExpr.empty()) {
+      const GridLockStatus st = inspectContainerAndPublish(
           state,
           host,
           rank,
-          state->tracked_expr,
-          state->tracked_type_hint,
+          candidateExpr,
+          candidateTypeHint,
           TriggerMode::InteractiveUser);
+      if (st == GRIDLOCK_OK) {
+        state->tracked_expr = std::move(candidateExpr);
+        state->tracked_type_hint = std::move(candidateTypeHint);
+      } else if (!hasExplicitArg) {
+        state->tracked_expr.clear();
+        state->tracked_type_hint.clear();
+      }
+      return st;
     }
 
     // No container tracked yet: report stop status cleanly on both log and telemetry channels.
@@ -1049,16 +1215,24 @@ GridLockStatus GRIDLOCK_CALL onMenuInspectExpression(
       return GRIDLOCK_OK;
     }
 
-    state->tracked_expr.assign(expr);
-    state->tracked_type_hint.clear();
+    const std::string candidateExpr(expr);
     const GridLockStatus st = inspectContainerAndPublish(
-        state, host, rank, state->tracked_expr, state->tracked_type_hint, TriggerMode::InteractiveUser);
-    if (st != GRIDLOCK_OK && host->show_toast != nullptr) {
+        state, host, rank, candidateExpr, std::string_view{}, TriggerMode::InteractiveUser);
+    if (st == GRIDLOCK_OK) {
+      state->tracked_expr = candidateExpr;
+      state->tracked_type_hint.clear();
+      return GRIDLOCK_OK;
+    }
+    if (host->show_toast != nullptr) {
+      const std::string toastMsg =
+          "'" + sanitizeSingleLine(candidateExpr, 96u) +
+          "' is not an in-scope contiguous numeric STL container on rank " +
+          std::to_string(rank) + ".";
       (void)host->show_toast(
           host->host_ctx,
           GRIDLOCK_DIALOG_WARNING,
           "STL Inspector: Evaluation Failed",
-          "Could not evaluate .size() / .data() for the entered expression on the stopped rank.",
+          toastMsg.c_str(),
           4000);
     }
     return st;
@@ -1109,6 +1283,7 @@ GridLockStatus GRIDLOCK_CALL onMenuClearAndReset(
 
     state->tracked_expr.clear();
     state->tracked_type_hint.clear();
+    state->last_inspected_expr.clear();
     state->last_json_payload.clear();
     state->has_last_stats = false;
 
