@@ -1,0 +1,6 @@
+{
+  global:
+    gridlock_plugin_init_v1;
+  local:
+    *;
+};

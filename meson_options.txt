@@ -1,0 +1,6 @@
+option(
+  'gridlock_include_dir',
+  type: 'string',
+  value: '/usr/local/include',
+  description: 'Path to the directory containing gridlock/plugin_api.h and gridlock/plugin_cpp_helpers.hpp',
+)

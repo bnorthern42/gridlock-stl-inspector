@@ -1,0 +1,28 @@
+# Build directories
+builddir/
+build/
+build_*/
+
+# Compiled shared libraries and object files
+*.so
+*.so.*
+*.dylib
+*.dll
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.a
+
+# Tooling & editor metadata
+compile_commands.json
+.cache/
+.clangd/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
